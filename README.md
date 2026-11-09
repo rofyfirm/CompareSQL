@@ -5,6 +5,8 @@ Aplikasi desktop macOS (Apple Silicon) untuk membandingkan dan menyinkronkan sch
 - **A** = target, yang akan diubah oleh script.
 - **B** = acuan, kondisi yang diinginkan.
 
+Penjelasan lengkap proyek (tujuan, alur kerja, cara kerja engine, status terhadap rencana): [docs/tentang-proyek.md](docs/tentang-proyek.md).
+
 ## Fitur
 
 - Schema diff: tabel, kolom, tipe, default, null, auto increment, PK, index, FK, CHECK, engine, charset/collation, komentar, urutan kolom.
