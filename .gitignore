@@ -1,0 +1,12 @@
+node_modules/
+dist/
+target/
+src-tauri/gen/
+*.log
+.DS_Store
+
+# Dump asli bisa berisi data pasien: jangan pernah masuk repo.
+# Hanya fixture sintetis di fixtures/ yang boleh.
+*.sql
+*.sql.gz
+!fixtures/**/*.sql

@@ -1,0 +1,22 @@
+[package]
+name = "selisih-core"
+description = "Core diff engine: dump reader, DDL parser, schema/data diff, sync script."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["live"]
+live = ["dep:mysql_async", "dep:tokio"]
+
+[dependencies]
+memchr = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+similar = "2"
+mysql_async = { version = "0.37", optional = true, default-features = false, features = ["minimal", "native-tls-tls"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

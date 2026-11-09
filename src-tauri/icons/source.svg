@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1F3A5F"/>
+      <stop offset="1" stop-color="#0F1E33"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- dua "tabel" berdampingan -->
+  <g fill="none" stroke-width="34" stroke-linecap="round">
+    <rect x="218" y="268" width="250" height="488" rx="40" stroke="#7FB2E5"/>
+    <rect x="556" y="268" width="250" height="488" rx="40" stroke="#F2B35A"/>
+  </g>
+  <g stroke-width="30" stroke-linecap="round">
+    <line x1="268" y1="372" x2="418" y2="372" stroke="#7FB2E5"/>
+    <line x1="268" y1="472" x2="418" y2="472" stroke="#7FB2E5"/>
+    <line x1="268" y1="572" x2="378" y2="572" stroke="#7FB2E5"/>
+    <line x1="268" y1="672" x2="418" y2="672" stroke="#7FB2E5"/>
+    <line x1="606" y1="372" x2="756" y2="372" stroke="#F2B35A"/>
+    <line x1="606" y1="472" x2="756" y2="472" stroke="#F2B35A"/>
+    <line x1="606" y1="572" x2="756" y2="572" stroke="#F2B35A"/>
+    <line x1="606" y1="672" x2="716" y2="672" stroke="#F2B35A"/>
+  </g>
+  <!-- penanda selisih -->
+  <circle cx="512" cy="572" r="58" fill="#E5534B"/>
+  <line x1="484" y1="572" x2="540" y2="572" stroke="#FFFFFF" stroke-width="22" stroke-linecap="round"/>
+</svg>

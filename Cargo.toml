@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[profile.release]
+codegen-units = 4
+lto = "thin"
+strip = true
+
+# Parsing dump besar lambat di debug build. Optimalkan core walau di dev.
+[profile.dev.package.selisih-core]
+opt-level = 2
