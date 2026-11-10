@@ -10,6 +10,7 @@
 //! 7. ADD FOREIGN KEY
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -68,23 +69,73 @@ pub struct Script {
     pub warnings: Vec<String>,
 }
 
-struct W {
-    sql: String,
-    n: usize,
-    warnings: Vec<String>,
+/// Hasil [`generate_to`].
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptStats {
+    pub statements: usize,
+    pub bytes: u64,
+    pub warnings: Vec<String>,
+    /// false bila berhenti karena `limit` (script lebih panjang dari yang ditulis).
+    pub complete: bool,
 }
 
-impl W {
+/// Penulis script ke sink apa pun (memori, file, atau hanya penghitung).
+/// Setelah `stopped`, semua tulisan berikutnya diabaikan dan loop besar
+/// memeriksa `stopped()` untuk keluar lebih awal.
+struct W<'o> {
+    out: &'o mut dyn Write,
+    bytes: u64,
+    n: usize,
+    warnings: Vec<String>,
+    /// Berhenti setelah statement yang membuat total >= limit.
+    limit: u64,
+    cancel: &'o dyn Fn() -> bool,
+    stopped: bool,
+    cancelled: bool,
+    err: Option<io::Error>,
+}
+
+impl W<'_> {
+    fn raw(&mut self, s: &str) {
+        if self.stopped {
+            return;
+        }
+        if let Err(e) = self.out.write_all(s.as_bytes()) {
+            self.err = Some(e);
+            self.stopped = true;
+            return;
+        }
+        self.bytes += s.len() as u64;
+    }
     fn emit(&mut self, stmt: &str) {
-        self.sql.push_str(stmt);
-        self.sql.push_str(";\n");
+        if self.stopped {
+            return;
+        }
+        self.raw(stmt);
+        self.raw(";\n");
         self.n += 1;
+        if self.bytes >= self.limit {
+            self.stopped = true;
+        } else if self.n.is_multiple_of(1024) {
+            self.check_cancel();
+        }
+    }
+    fn check_cancel(&mut self) {
+        if !self.stopped && (self.cancel)() {
+            self.cancelled = true;
+            self.stopped = true;
+        }
     }
     fn section(&mut self, title: &str) {
-        self.sql.push_str(&format!("\n-- {title}\n"));
+        self.check_cancel();
+        self.raw(&format!("\n-- {title}\n"));
     }
     fn note(&mut self, text: &str) {
-        self.sql.push_str(&format!("-- {text}\n"));
+        self.raw(&format!("-- {text}\n"));
+    }
+    fn stopped(&self) -> bool {
+        self.stopped
     }
 }
 
@@ -133,20 +184,60 @@ pub fn topo_order(tables: &[&Table]) -> (Vec<String>, bool) {
     (out, cycle)
 }
 
+/// Buat seluruh script di memori.
 pub fn generate(input: &ScriptInput, opts: &ScriptOptions) -> Script {
+    let mut buf = Vec::new();
+    let st = generate_to(input, opts, &mut buf, None, &|| false).expect("menulis ke Vec tidak gagal");
+    Script { sql: String::from_utf8(buf).expect("script selalu UTF-8"), statements: st.statements, warnings: st.warnings }
+}
+
+/// Tulis script ke `out` secara streaming, tanpa menahan seluruh script di memori.
+///
+/// `limit`: berhenti setelah statement yang membuat total byte >= limit
+/// (untuk pratinjau; `complete` = false). `cancel` dicek di awal tiap bagian
+/// dan tiap 1024 statement; bila true, hasilnya `Error::Cancelled`.
+pub fn generate_to(
+    input: &ScriptInput,
+    opts: &ScriptOptions,
+    out: &mut dyn Write,
+    limit: Option<u64>,
+    cancel: &dyn Fn() -> bool,
+) -> crate::Result<ScriptStats> {
+    let mut w = W {
+        out,
+        bytes: 0,
+        n: 0,
+        warnings: vec![],
+        limit: limit.unwrap_or(u64::MAX),
+        cancel,
+        stopped: false,
+        cancelled: false,
+        err: None,
+    };
+    write_script(&mut w, input, opts);
+    if let Some(e) = w.err {
+        return Err(e.into());
+    }
+    if w.cancelled {
+        return Err(crate::Error::Cancelled);
+    }
+    Ok(ScriptStats { statements: w.n, bytes: w.bytes, warnings: w.warnings, complete: !w.stopped })
+}
+
+fn write_script(w: &mut W, input: &ScriptInput, opts: &ScriptOptions) {
     let cmp = input.compare;
-    let selected = |name: &str| opts.tables.as_ref().is_none_or(|v| v.iter().any(|x| x == &lc(name)));
+    let selected: Option<HashSet<&str>> = opts.tables.as_ref().map(|v| v.iter().map(String::as_str).collect());
+    let selected = |name: &str| selected.as_ref().is_none_or(|s| s.contains(lc(name).as_str()));
     let pairs: Vec<(Option<&Table>, Option<&Table>)> = pair_tables(input.schema_a, input.schema_b, cmp)
         .into_iter()
         .filter(|(a, b)| selected(&a.or(*b).unwrap().name))
         .collect();
 
-    let mut w = W { sql: String::new(), n: 0, warnings: vec![] };
     for h in &input.header {
         w.note(h);
     }
     w.note("Catatan: DDL MySQL melakukan commit implisit; jalankan pada salinan atau setelah backup.");
-    w.sql.push('\n');
+    w.raw("\n");
     w.emit("SET NAMES utf8mb4");
     w.emit("SET @OLD_TIME_ZONE=@@TIME_ZONE");
     w.emit("SET TIME_ZONE='+00:00'");
@@ -320,15 +411,15 @@ pub fn generate(input: &ScriptInput, opts: &ScriptOptions) -> Script {
             w.section("5. Hapus baris (anak dulu)");
             for d in ordered.iter().rev() {
                 let (name, tb) = &target_name[&lc(&d.table)];
-                write_deletes(&mut w, name, tb, d, opts);
+                write_deletes(w, name, tb, d, opts);
             }
         }
         if ordered.iter().any(|d| !d.only_in_b.is_empty() || !d.changed.is_empty()) {
             w.section("6. Ubah dan tambah baris (induk dulu)");
             for d in &ordered {
                 let (name, tb) = &target_name[&lc(&d.table)];
-                write_updates(&mut w, name, tb, d);
-                write_inserts(&mut w, name, tb, d, opts);
+                write_updates(w, name, tb, d);
+                write_inserts(w, name, tb, d, opts);
             }
         }
     }
@@ -349,13 +440,12 @@ pub fn generate(input: &ScriptInput, opts: &ScriptOptions) -> Script {
         }
     }
 
-    w.sql.push('\n');
+    w.raw("\n");
     if opts.disable_fk_checks {
         w.emit("SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS");
     }
     w.emit("SET SQL_MODE=@OLD_SQL_MODE");
     w.emit("SET TIME_ZONE=@OLD_TIME_ZONE");
-    Script { sql: w.sql, statements: w.n, warnings: w.warnings }
 }
 
 fn position(prev: Option<&str>) -> String {
@@ -509,7 +599,7 @@ fn where_key(d: &TableDataDiff, cls: &[TypeClass], row: &[Cell]) -> String {
 }
 
 fn write_deletes(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff, opts: &ScriptOptions) {
-    if d.only_in_a.is_empty() {
+    if d.only_in_a.is_empty() || w.stopped() {
         return;
     }
     let cls = classes(tb, d);
@@ -517,6 +607,9 @@ fn write_deletes(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff, opts: &Sc
     if d.key_mode == Some(KeyMode::FullRow) {
         let cols: Vec<usize> = (0..d.columns.len()).filter(|i| !d.missing_in_a.contains(i)).collect();
         for row in &d.only_in_a {
+            if w.stopped() {
+                return;
+            }
             let conds: Vec<String> = cols
                 .iter()
                 .map(|&i| {
@@ -537,6 +630,9 @@ fn write_deletes(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff, opts: &Sc
         format!("DELETE FROM {} WHERE ({}) IN (", q(name), cols.join(","))
     };
     for chunk in d.only_in_a.chunks(opts.batch_rows.max(1)) {
+        if w.stopped() {
+            return;
+        }
         let mut s = head.clone();
         for (i, row) in chunk.iter().enumerate() {
             if i > 0 {
@@ -562,12 +658,15 @@ fn write_deletes(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff, opts: &Sc
 }
 
 fn write_updates(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff) {
-    if d.changed.is_empty() {
+    if d.changed.is_empty() || w.stopped() {
         return;
     }
     let cls = classes(tb, d);
     w.note(&format!("{}: ubah {} baris", q(name), d.changed.len()));
     for row in &d.changed {
+        if w.stopped() {
+            return;
+        }
         let cols = changed_columns(d, row);
         if cols.is_empty() {
             continue;
@@ -585,7 +684,7 @@ fn write_updates(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff) {
 }
 
 fn write_inserts(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff, opts: &ScriptOptions) {
-    if d.only_in_b.is_empty() {
+    if d.only_in_b.is_empty() || w.stopped() {
         return;
     }
     let cls = classes(tb, d);
@@ -613,6 +712,9 @@ fn write_inserts(w: &mut W, name: &str, tb: &Table, d: &TableDataDiff, opts: &Sc
             w.emit(&s);
             s.clear();
             rows = 0;
+            if w.stopped() {
+                return;
+            }
         }
     }
     if rows > 0 {

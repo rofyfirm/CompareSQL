@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, pickSavePath } from "../lib/api";
 import type { ScriptOptions, ScriptPreview } from "../lib/types";
 
@@ -56,16 +56,31 @@ export function ScriptView(p: Props) {
   const { options: o, onOptions } = p;
   const [preview, setPreview] = useState<ScriptPreview | null>(null);
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Nomor permintaan terakhir: hasil permintaan lama (opsi sudah berubah) dibuang.
+  const seq = useRef(0);
+  useEffect(() => () => void seq.current++, []);
 
   const regenerate = async (opts: ScriptOptions) => {
+    const my = ++seq.current;
     setBusy(true);
     try {
-      setPreview(await api.generateScript(opts));
-    } catch (e) {
-      p.onError((e as Error).message);
-    } finally {
+      // Pratinjau dulu (cepat), lalu total statement/ukuran menyusul.
+      const pv = await api.generateScript(opts);
+      if (my !== seq.current) return;
+      setPreview(pv);
       setBusy(false);
+      if (pv.statements === null) {
+        const t = await api.scriptTotals(pv.id);
+        if (my !== seq.current) return;
+        setPreview((cur) => (cur?.id === pv.id ? { ...cur, ...t } : cur));
+      }
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (my === seq.current && !/dibatalkan/i.test(msg)) p.onError(msg);
+    } finally {
+      if (my === seq.current) setBusy(false);
     }
   };
 
@@ -81,10 +96,13 @@ export function ScriptView(p: Props) {
   const save = async () => {
     const path = await pickSavePath("selisih-sync.sql");
     if (!path) return;
+    setSaving(true);
     try {
       await api.saveScript(path);
     } catch (e) {
       p.onError((e as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -138,21 +156,27 @@ export function ScriptView(p: Props) {
           </div>
           <div className="script-main">
             <div className="script-bar">
-              {preview && (
+              {preview && preview.statements !== null && preview.totalBytes !== null && (
                 <span className="muted">
                   {preview.statements.toLocaleString("id")} statement · {fmtBytes(preview.totalBytes)}
                 </span>
               )}
-              {busy && <span className="muted">membuat…</span>}
+              {busy ? (
+                <span className="muted">membuat…</span>
+              ) : (
+                preview?.statements === null && <span className="muted">menghitung total…</span>
+              )}
               <span className="spacer" />
               <button className="btn" disabled={!preview || preview.truncated} onClick={copy} title={preview?.truncated ? "Script terlalu besar; simpan ke file" : ""}>
                 {copied ? "Tersalin" : "Salin"}
               </button>
-              <button className="btn" disabled={!preview} onClick={save}>Simpan .sql…</button>
+              <button className="btn" disabled={!preview || saving} onClick={save}>
+                {saving ? "Menyimpan…" : "Simpan .sql…"}
+              </button>
               <button
                 className="btn danger"
-                disabled={!preview || !p.canExecute || busy}
-                onClick={() => preview && p.onExecute(preview.statements)}
+                disabled={!preview || preview.statements === null || !p.canExecute || busy}
+                onClick={() => preview?.statements != null && p.onExecute(preview.statements)}
                 title={p.canExecute ? `Jalankan di database ${p.targetDb}` : "Hanya bisa bila A adalah database live"}
               >
                 Jalankan di A…
@@ -165,7 +189,10 @@ export function ScriptView(p: Props) {
               </div>
             )}
             {preview?.truncated && (
-              <div className="warn">Pratinjau dipotong ({fmtBytes(preview.preview.length)}). Simpan ke file untuk melihat semuanya.</div>
+              <div className="warn">
+                Pratinjau dipotong ({fmtBytes(preview.preview.length)}
+                {preview.totalBytes !== null && ` dari ${fmtBytes(preview.totalBytes)}`}). Simpan ke file untuk melihat semuanya.
+              </div>
             )}
             <pre className="code selectable" style={{ flex: 1 }}>
               {preview ? <Highlighted text={preview.preview} /> : <span className="ln cm">-- membuat script…</span>}

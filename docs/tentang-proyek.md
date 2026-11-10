@@ -87,6 +87,15 @@ Urutan script dirancang supaya foreign key tidak menggagalkan proses:
 
 Urutan induk-anak dihitung dengan *topological sort* atas relasi foreign key. Nilai biner ditulis sebagai `0x...`, string di-escape gaya MySQL, dan script diawali `SET NAMES utf8mb4` dan `TIME_ZONE='+00:00'`.
 
+Script tidak disimpan utuh di memori. Generator menulis secara streaming ke tujuan yang dibutuhkan:
+
+- **Pratinjau**: berhenti setelah sekitar 2 MB, jadi tampil dalam hitungan milidetik berapa pun besar diff-nya.
+- **Total** (jumlah statement dan ukuran): dihitung di latar belakang tanpa menyimpan isi script, lalu ditampilkan menyusul. Hitungan ini batal sendiri bila opsi diubah sebelum selesai.
+- **Simpan .sql**: ditulis langsung ke file.
+- **Jalankan di A**: script dibuat di memori tepat sebelum dieksekusi.
+
+Header script, termasuk waktu pembuatan, ditetapkan sekali per set opsi, jadi file yang disimpan sama persis dengan pratinjau.
+
 ### 6. Eksekusi
 
 Script dijalankan statement demi statement. `INSERT`/`UPDATE`/`DELETE` dikelompokkan dalam transaksi; DDL dijalankan di luar transaksi karena MySQL melakukan commit otomatis untuk DDL. Eksekusi berhenti di error pertama, transaksi DML yang sedang berjalan di-rollback, dan laporan menunjukkan statement mana yang gagal.
@@ -136,7 +145,7 @@ Definition of done MVP:
 
 1. Jalankan round-trip ke MySQL 8.0, 8.4, MariaDB 10.11, dan 11 lewat `docker-compose.yml`.
 2. Uji dengan dump asli (`tes_0.sql` + `tes.sql`) secara lokal, tanpa memasukkannya ke repo.
-3. Tulis script langsung ke file saat dibuat (streaming), supaya diff besar tidak menahan semua baris di memori.
+3. Kurangi memori data diff: baris yang berbeda masih disimpan utuh di memori sampai script dibuat (script sendiri sudah ditulis streaming).
 4. Hash per chunk di sisi server untuk sumber live, supaya tabel besar tidak perlu ditarik utuh lewat jaringan.
 5. Sign dan notarize build untuk distribusi.
 

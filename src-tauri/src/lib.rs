@@ -2,7 +2,8 @@
 
 mod connections;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ use selisih_core::progress::Progress;
 use selisih_core::render::render_create_table;
 use selisih_core::row::Cell;
 use selisih_core::schema_diff::{Change, Status};
-use selisih_core::script::{generate, ScriptInput, ScriptOptions};
+use selisih_core::script::{generate_to, ScriptInput, ScriptOptions, ScriptStats};
 use serde::{Deserialize, Serialize};
 use similar::{DiffTag, TextDiff};
 use tauri::{AppHandle, Emitter, State};
@@ -30,10 +31,37 @@ struct Session {
     a_live: Option<(ConnParams, String)>,
 }
 
+/// Script untuk satu set opsi. Isinya tidak disimpan: dibuat ulang secara
+/// streaming saat dibutuhkan (pratinjau, hitung total, simpan, eksekusi),
+/// supaya diff besar tidak menahan script ratusan MB di memori.
+struct ScriptJob {
+    id: u64,
+    session: Arc<Session>,
+    options: ScriptOptions,
+    header: Vec<String>,
+    totals: Mutex<Option<ScriptTotals>>,
+}
+
+impl ScriptJob {
+    fn write(&self, out: &mut dyn Write, limit: Option<u64>, cancel: &dyn Fn() -> bool) -> selisih_core::Result<ScriptStats> {
+        let r = &self.session.res;
+        let input = ScriptInput {
+            schema_a: &r.schema_a,
+            schema_b: &r.schema_b,
+            data: &r.data,
+            compare: &self.session.req.options,
+            header: self.header.clone(),
+        };
+        generate_to(&input, &self.options, out, limit, cancel)
+    }
+}
+
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<Arc<Session>>>,
-    script: Mutex<Option<Arc<String>>>,
+    script: Mutex<Option<Arc<ScriptJob>>>,
+    /// Naik tiap kali script dibuat ulang; hitung total yang lama berhenti.
+    script_gen: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -221,6 +249,8 @@ async fn compare(app: AppHandle, state: State<'_, AppState>, input: CompareInput
     let (a, a_live) = to_spec(&app, input.a)?;
     let (b, _) = to_spec(&app, input.b)?;
     let req = CompareRequest { a, b, compare_data: input.compare_data, options: input.options, ..Default::default() };
+    // Hentikan hitung total script dari hasil sebelumnya.
+    state.script_gen.fetch_add(1, Ordering::SeqCst);
     state.cancel.store(false, Ordering::Relaxed);
     let cancel = state.cancel.clone();
     let app2 = app.clone();
@@ -388,14 +418,47 @@ async fn table_detail(state: State<'_, AppState>, name: String) -> Result<TableD
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScriptPreview {
+    id: u64,
     preview: String,
     truncated: bool,
-    total_bytes: usize,
-    statements: usize,
+    /// None selama total belum dihitung; UI lalu memanggil `script_totals`.
+    total_bytes: Option<u64>,
+    statements: Option<usize>,
     warnings: Vec<String>,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScriptTotals {
+    statements: usize,
+    total_bytes: u64,
+    warnings: Vec<String>,
+}
+
+impl From<ScriptStats> for ScriptTotals {
+    fn from(s: ScriptStats) -> Self {
+        ScriptTotals { statements: s.statements, total_bytes: s.bytes, warnings: s.warnings }
+    }
+}
+
 const PREVIEW_BYTES: usize = 2 << 20;
+
+/// Potong pratinjau di akhir baris terakhir yang muat dalam PREVIEW_BYTES.
+fn cut_preview(buf: Vec<u8>, complete: bool) -> (String, bool) {
+    let mut s = String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let truncated = !complete || s.len() > PREVIEW_BYTES;
+    if s.len() > PREVIEW_BYTES {
+        let mut cut = PREVIEW_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(nl) = s[..cut].rfind('\n') {
+            cut = nl + 1;
+        }
+        s.truncate(cut);
+    }
+    (s, truncated)
+}
 
 fn utc_now() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -413,61 +476,104 @@ fn utc_now() -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+fn current_job(state: &AppState, id: Option<u64>) -> Result<Arc<ScriptJob>, String> {
+    let job = state.script.lock().unwrap().clone().ok_or("Script belum dibuat")?;
+    match id {
+        Some(i) if i != job.id => Err("dibatalkan".into()),
+        _ => Ok(job),
+    }
+}
+
+/// Pratinjau saja: berhenti setelah ~2 MB, jadi cepat berapa pun besar diff-nya.
 #[tauri::command]
 async fn generate_script(state: State<'_, AppState>, options: ScriptOptions) -> Result<ScriptPreview, String> {
     let s = state.session.lock().unwrap().clone().ok_or("Belum ada hasil perbandingan")?;
-    let script = off_runtime(move || {
-        let r = &s.res;
-        generate(
-            &ScriptInput {
-                schema_a: &r.schema_a,
-                schema_b: &r.schema_b,
-                data: &r.data,
-                compare: &s.req.options,
-                header: vec![
-                    format!("Selisih - script sinkronisasi, dibuat {}", utc_now()),
-                    format!("Target (A): {}", r.label_a),
-                    format!("Sumber (B): {}", r.label_b),
-                ],
-            },
-            &options,
-        )
+    let id = state.script_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let header = vec![
+        format!("Selisih - script sinkronisasi, dibuat {}", utc_now()),
+        format!("Target (A): {}", s.res.label_a),
+        format!("Sumber (B): {}", s.res.label_b),
+    ];
+    let job = Arc::new(ScriptJob { id, session: s, options, header, totals: Mutex::new(None) });
+    *state.script.lock().unwrap() = Some(job.clone());
+    let j = job.clone();
+    let (buf, st) = off_runtime(move || {
+        let mut buf = Vec::with_capacity(PREVIEW_BYTES + (64 << 10));
+        j.write(&mut buf, Some(PREVIEW_BYTES as u64), &|| false).map(|st| (buf, st))
     })
-    .await?;
-    let total = script.sql.len();
-    let mut cut = total.min(PREVIEW_BYTES);
-    while !script.sql.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let preview = ScriptPreview {
-        preview: script.sql[..cut].to_string(),
-        truncated: cut < total,
-        total_bytes: total,
-        statements: script.statements,
-        warnings: script.warnings,
-    };
-    *state.script.lock().unwrap() = Some(Arc::new(script.sql));
-    Ok(preview)
+    .await?
+    .map_err(|e| e.to_string())?;
+    let (preview, truncated) = cut_preview(buf, st.complete);
+    let totals = st.complete.then(|| ScriptTotals::from(st.clone()));
+    *job.totals.lock().unwrap() = totals.clone();
+    Ok(ScriptPreview {
+        id,
+        preview,
+        truncated,
+        total_bytes: totals.as_ref().map(|t| t.total_bytes),
+        statements: totals.as_ref().map(|t| t.statements),
+        warnings: st.warnings,
+    })
 }
 
+/// Hitung jumlah statement dan ukuran script tanpa menyimpannya.
+/// Gagal dengan "dibatalkan" bila script sudah dibuat ulang dengan opsi lain.
+#[tauri::command]
+async fn script_totals(state: State<'_, AppState>, id: u64) -> Result<ScriptTotals, String> {
+    let job = current_job(&state, Some(id))?;
+    if let Some(t) = job.totals.lock().unwrap().clone() {
+        return Ok(t);
+    }
+    let gen = state.script_gen.clone();
+    let j = job.clone();
+    let st = off_runtime(move || j.write(&mut std::io::sink(), None, &|| gen.load(Ordering::Relaxed) != id))
+        .await?
+        .map_err(|e| e.to_string())?;
+    let t = ScriptTotals::from(st);
+    *job.totals.lock().unwrap() = Some(t.clone());
+    Ok(t)
+}
+
+/// Tulis script langsung ke file (streaming).
 #[tauri::command]
 async fn save_script(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let sql = state.script.lock().unwrap().clone().ok_or("Script belum dibuat")?;
-    off_runtime(move || std::fs::write(&path, sql.as_bytes()).map_err(|e| e.to_string())).await?
+    let job = current_job(&state, None)?;
+    off_runtime(move || {
+        let f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        let mut w = BufWriter::with_capacity(1 << 20, f);
+        let r = job.write(&mut w, None, &|| false).and_then(|st| {
+            w.flush()?;
+            Ok(st)
+        });
+        drop(w);
+        match r {
+            Ok(st) => {
+                *job.totals.lock().unwrap() = Some(st.into());
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                Err(e.to_string())
+            }
+        }
+    })
+    .await?
 }
 
 #[tauri::command]
 async fn execute_script(app: AppHandle, state: State<'_, AppState>, confirm: String) -> Result<ExecReport, String> {
-    let s = state.session.lock().unwrap().clone().ok_or("Belum ada hasil perbandingan")?;
-    let (params, db) = s.a_live.clone().ok_or("Sisi A bukan database live; simpan script lalu jalankan sendiri")?;
+    let job = current_job(&state, None)?;
+    let (params, db) =
+        job.session.a_live.clone().ok_or("Sisi A bukan database live; simpan script lalu jalankan sendiri")?;
     if confirm != db {
         return Err("Nama database konfirmasi tidak cocok".into());
     }
-    let sql = state.script.lock().unwrap().clone().ok_or("Script belum dibuat")?;
     state.cancel.store(false, Ordering::Relaxed);
     let cancel = state.cancel.clone();
     let rep = off_runtime(move || {
-        selisih_core::live::execute_script(&params, &db, sql.as_bytes(), &Emit::new(app, cancel))
+        let mut sql = Vec::new();
+        job.write(&mut sql, None, &|| false)?;
+        selisih_core::live::execute_script(&params, &db, &sql, &Emit::new(app, cancel))
     })
     .await?
     .map_err(|e| e.to_string())?;
@@ -516,6 +622,7 @@ pub fn run() {
             cancel,
             table_detail,
             generate_script,
+            script_totals,
             save_script,
             execute_script,
             list_connections,
@@ -575,6 +682,18 @@ mod tests {
         assert_eq!(line["kind"], "onlyA");
         let rep = serde_json::to_value(ExecReport::default()).unwrap();
         assert!(rep.get("elapsedMs").is_some());
+    }
+
+    #[test]
+    fn preview_is_cut_at_line_end() {
+        let (s, t) = cut_preview(b"SELECT 1;\n".to_vec(), true);
+        assert_eq!((s.as_str(), t), ("SELECT 1;\n", false));
+        // Belum selesai = terpotong walau masih kecil.
+        assert!(cut_preview(b"SELECT 1;\n".to_vec(), false).1);
+        let line = "INSERT INTO t VALUES (1,'é');\n";
+        let big = line.repeat(PREVIEW_BYTES / line.len() + 10);
+        let (s, t) = cut_preview(big.into_bytes(), true);
+        assert!(t && s.len() <= PREVIEW_BYTES && s.ends_with(";\n"));
     }
 
     #[test]

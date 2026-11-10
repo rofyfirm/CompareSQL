@@ -9,6 +9,7 @@ import type {
   ProgressEvent,
   ScriptOptions,
   ScriptPreview,
+  ScriptTotals,
   SideInput,
   TableDetail,
 } from "./types";
@@ -43,6 +44,7 @@ export const api = {
   cancel: () => call<void>("cancel"),
   tableDetail: (name: string) => call<TableDetail>("table_detail", { name }),
   generateScript: (options: ScriptOptions) => call<ScriptPreview>("generate_script", { options }),
+  scriptTotals: (id: number) => call<ScriptTotals>("script_totals", { id }),
   saveScript: (path: string) => call<void>("save_script", { path }),
   executeScript: (confirm: string) => call<ExecReport>("execute_script", { confirm }),
   listConnections: () => call<ConnectionProfile[]>("list_connections"),
