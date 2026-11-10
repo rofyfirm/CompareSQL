@@ -5,6 +5,7 @@ import type {
   ExecReport,
   ProgressEvent,
   ScriptPreview,
+  ScriptTotals,
   TableDetail,
 } from "./types";
 
@@ -15,6 +16,7 @@ export function mockOnProgress(cb: (p: ProgressEvent) => void) {
 }
 const emit = (p: ProgressEvent) => listeners.forEach((l) => l(p));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let scriptId = 0;
 
 let connections: ConnectionProfile[] = [
   { id: "c1", name: "Lokal MariaDB", host: "127.0.0.1", port: 3306, user: "root", useTls: false, acceptInvalidCerts: false, hasPassword: true },
@@ -235,12 +237,15 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
     case "generate_script":
       await sleep(150);
       return {
+        id: ++scriptId,
         preview: script,
         truncated: false,
         totalBytes: script.length,
         statements: 9,
         warnings: ["pasien: kolom `telepon` di-drop, datanya hilang"],
       } satisfies ScriptPreview;
+    case "script_totals":
+      return { statements: 9, totalBytes: script.length, warnings: ["pasien: kolom `telepon` di-drop, datanya hilang"] } satisfies ScriptTotals;
     case "save_script":
       return null;
     case "execute_script": {

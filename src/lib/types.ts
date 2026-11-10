@@ -136,10 +136,18 @@ export const defaultScriptOptions: ScriptOptions = {
 };
 
 export interface ScriptPreview {
+  id: number;
   preview: string;
   truncated: boolean;
-  totalBytes: number;
+  /** null selama total masih dihitung; lihat api.scriptTotals. */
+  totalBytes: number | null;
+  statements: number | null;
+  warnings: string[];
+}
+
+export interface ScriptTotals {
   statements: number;
+  totalBytes: number;
   warnings: string[];
 }
 

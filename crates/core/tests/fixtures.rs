@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use selisih_core::engine::{run_compare, CompareRequest, CompareResult, SideSpec};
 use selisih_core::progress::NoProgress;
 use selisih_core::schema_diff::Status;
-use selisih_core::script::{generate, ScriptInput, ScriptOptions};
+use selisih_core::script::{generate, generate_to, ScriptInput, ScriptOptions};
 
 fn fx(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(name)
@@ -105,6 +105,38 @@ fn golden_diff_a_to_b() {
     // Nilai biner dan BIT ditulis dengan aman.
     assert!(sql.contains("`foto`=0x89504E470D0A1A0A00"));
     assert!(sql.contains("`flags`=10"));
+}
+
+#[test]
+fn streaming_script_matches_full_and_stops_at_limit() {
+    let (req, r) = compare(file("klinik_a.sql", None), file("klinik_b.sql", None));
+    let input =
+        ScriptInput { schema_a: &r.schema_a, schema_b: &r.schema_b, data: &r.data, compare: &req.options, header: vec![] };
+    let opts = ScriptOptions { batch_rows: 1, ..Default::default() };
+    let full = generate(&input, &opts);
+
+    // Tanpa limit: isi dan hitungan sama persis dengan generate().
+    let mut buf = Vec::new();
+    let st = generate_to(&input, &opts, &mut buf, None, &|| false).unwrap();
+    assert!(st.complete);
+    assert_eq!(buf, full.sql.as_bytes());
+    assert_eq!((st.statements, st.bytes, &st.warnings), (full.statements, full.sql.len() as u64, &full.warnings));
+
+    // Hanya menghitung (sink): hasil hitungan sama.
+    let st2 = generate_to(&input, &opts, &mut std::io::sink(), None, &|| false).unwrap();
+    assert_eq!((st2.statements, st2.bytes), (st.statements, st.bytes));
+
+    // Dengan limit: berhenti di batas statement, hasilnya awalan script penuh.
+    let mut buf = Vec::new();
+    let st = generate_to(&input, &opts, &mut buf, Some(600), &|| false).unwrap();
+    assert!(!st.complete);
+    assert!(buf.len() >= 600 && buf.len() < full.sql.len());
+    assert!(buf.ends_with(b";\n"));
+    assert!(full.sql.as_bytes().starts_with(&buf));
+
+    // Batal.
+    let e = generate_to(&input, &opts, &mut std::io::sink(), None, &|| true);
+    assert!(matches!(e, Err(selisih_core::Error::Cancelled)));
 }
 
 #[test]
